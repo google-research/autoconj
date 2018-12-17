@@ -19,7 +19,6 @@ from __future__ import print_function
 import autograd.numpy as np
 from autograd import grad
 from autograd import value_and_grad
-from autograd import fmap_util
 
 from . import conjugacy
 
@@ -60,6 +59,7 @@ def cavi(log_joint, init_vals, supports, num_iters, callback=None):
 ### util
 
 
+# TODO tree map
 def dot(a, b):
   tot = [0.]
   def _dot(a, b):

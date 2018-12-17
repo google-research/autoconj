@@ -382,13 +382,6 @@ def replace_node_with_expr(node, expr):
   return node
 
 
-def _const_fun(val):
-  fun = lambda: val
-  fun.fmap_in = map
-  fun.fmap_out = apply
-  return fun
-
-
 def _mutate_node(target_node, source_node, **kwargs):
   for attrname in target_node.__slots__:
     attrval = kwargs.get(attrname, getattr(source_node, attrname))
