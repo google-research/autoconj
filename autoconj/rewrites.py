@@ -101,6 +101,13 @@ def maybe_subtract(x, y):
   return add_n(x, _multiply_as_einsum(-1, y))
 
 
+def maybe_getitem(x, idx):
+  if isinstance(idx, slice):
+    return list(x)[idx]
+  else:
+    return x[idx]
+
+
 def dot_as_einsum(x, y):
   if x.ndim == 0 or y.ndim == 0: return np.einsum(',->', x, y)
   if x.ndim == y.ndim == 1: return np.einsum('i,i->', x, y)
@@ -125,6 +132,13 @@ def maybe_power(base, exponent):
     return base
   elif exponent == 0:
     return 1
+  elif isinstance(exponent, int) and exponent > 0 and exponent < 10:
+    formula = ''.join([_einsum_range[i] for i in range(len(base.shape))])
+    in_formulas = [formula for _ in range(exponent)]
+    out_formula = formula
+    formula = _reconstitute_einsum_formula(in_formulas, out_formula)
+    args = [base for _ in range(exponent)]
+    return np.einsum(formula, *args)
   else:
     return base ** exponent
 
@@ -145,44 +159,57 @@ def _rename_formula_indices(formula):
   return ''.join([translator(i) for i in formula])
 
 
-def _remove_ellipsis(formula, args):
-  """Replaces any `...` in formula with explicit indices."""
+def debroadcast_formula(formula, *arg_ndims):
+  """Given an einsum's formula string and the dimensions of the arguments
+  provided to the einsum, converts any broadcasting ellipses into appropriate
+  letters.
+  """
   formula = _rename_formula_indices(formula)
-  args = [np.array(arg) for arg in args]
+  num_chars = len(_einsum_index_set.intersection(set(formula)))
+  remaining_letters = _einsum_range[num_chars:]
+  in_formulas, out_formula = split_einsum_formula(formula)
 
-  broadcast_indices = None
-  new_indices = ''
-  in_formula, out_formula = formula.split('->')
-  for indices, shape in zip(in_formula.split(','), [arg.shape for arg in args]):
-    if '...' in indices:
-      new_broadcast_indices = shape[
-          indices.find('.'):len(indices) - indices.rfind('.') - 3]
-      if broadcast_indices is not None:
-        assert broadcast_indices == new_broadcast_indices
-      else:
-        broadcast_indices = new_broadcast_indices
-        max_index = max([_einsum_range.find(i) for i in formula])
-        new_indices = _einsum_range[
-            max_index+1:max_index+1+len(broadcast_indices)]
-  return _rename_formula_indices(formula.replace('...', new_indices))
+  max_ellipsis_dims = -float('inf')
+  for i, in_formula in enumerate(in_formulas):
+    in_formula = decompose_formula(in_formula)
+    if '...' in in_formula:
+      num_ellipsis_dims = arg_ndims[i]-len(in_formula)+1
+      max_ellipsis_dims = max(max_ellipsis_dims, num_ellipsis_dims)
+      ellipsis_idx = in_formula.index('...')
+      in_formula[ellipsis_idx] = remaining_letters[:num_ellipsis_dims][::-1]
+    in_formulas[i] = ''.join(in_formula)
+
+  if '...' in out_formula:
+    out_formula = out_formula.replace(
+        '...', remaining_letters[:max_ellipsis_dims][::-1])
+
+  new_formula = _reconstitute_einsum_formula(in_formulas, out_formula)
+  return _rename_formula_indices(new_formula)
 
 
 def _zeros_like_einsum(formula, args1, args2):
   args = args1 + args2
   input_formulas, output_formula = split_einsum_formula(formula)
+  output_formula = decompose_formula(output_formula)
   input_formulas = input_formulas[:len(args1)] + input_formulas[len(args1)+1:]
+  input_formulas = [decompose_formula(input_formula) for
+                    input_formula in input_formulas]
+
   out_shape = []
   for output_index in output_formula:
     for i, input_formula in enumerate(input_formulas):
-      position = input_formula.find(output_index)
-      if position != -1:
+      position = input_formula.index(output_index)
+      if position != -1 and output_index != '...':
         out_shape.append(args[i].shape[position])
         break
+      elif position != -1 and output_index == '...':
+        for offset in range(args[i].ndim-len(input_formula)+1):
+          out_shape.append(args[i].shape[position+offset])
   return np.zeros(out_shape, dtype=np.result_type(*args))
 
 
 def maybe_einsum(formula, *args):
-  formula = _remove_ellipsis(formula, args)
+  formula = debroadcast_formula(formula, *[np.ndim(arg) for arg in args])
 
   if any(_is_constant_zero(arg) for arg in args):
     return _zeros_like_einsum(formula, args, ())
@@ -266,6 +293,66 @@ def _sum_as_einsum(x, axis=None):
 
 replace_sum = Rule(_sum_pat, _sum_as_einsum)
 
+## move log behind an einsum if the other argument is a onehot
+_log_oneh_einsum_pat = (Log,
+                        (Einsum, Str('formula'),
+                         (OneHot, Node('x'), Scalar('depth')),
+                         Val('y')))
+
+
+def _log_behind_onehot_einsum_pred(formula, x, depth, y):
+  """Confirms sum is only over index added by one_hot."""
+  # TODO(matthewjmackay): broadcasting support might be needed here
+  if '...' in formula:
+    return False
+  in_formulas, out_formula = split_einsum_formula(formula)
+  oneh_index = in_formulas[0][-1]
+  other_indices = set([ch for in_formula in in_formulas
+                       for ch in in_formula])
+  other_indices.remove(oneh_index)
+  out_indices = set(out_formula)
+  return other_indices == out_indices
+
+
+def _log_behind_onehot_einsum(formula, x, depth, y):
+  return np.einsum(formula, tracers.one_hot(x, depth), np.log(y))
+
+log_behind_onehot_einsum = Rule(_log_oneh_einsum_pat, _log_behind_onehot_einsum,
+                                (_log_behind_onehot_einsum_pred,))
+
+## move log-add behind an einsum if the other argument is a onehot
+_log_addn_oneh_einsum_pat = (Log,
+                             (AddN, Val('x'),
+                              (Einsum, Str('formula'), Scalar('scale'),
+                               (OneHot, Node('y'), Scalar('depth')),
+                               Val('z'))))
+
+
+def _log_addn_behind_onehot_einsum_pred(x, formula, scale, y, depth, z):
+  """Confirms sum is only over index added by one_hot"""
+  # TODO(matthewjmackay): broadcasting support might be needed here
+  if '...' in formula:
+    return False
+  in_formulas, out_formula = split_einsum_formula(formula)
+  oneh_index = in_formulas[1][-1]
+  other_indices = set([ch for in_formula in in_formulas
+                       for ch in in_formula])
+  other_indices.remove(oneh_index)
+  out_indices = set(out_formula)
+  return other_indices == out_indices
+
+
+def _log_addn_behind_onehot_einsum(x, formula, scale, y, depth, z):
+  in_formulas, out_formula = split_einsum_formula(formula)
+  in_formulas = in_formulas[1:]
+  formula = _reconstitute_einsum_formula(in_formulas, out_formula)
+  return np.einsum(formula,
+                   tracers.one_hot(y, depth),
+                   np.log(add_n(x, scale*z)))
+
+log_addn_behind_onehot_einsum = Rule(_log_addn_oneh_einsum_pat,
+                                     _log_addn_behind_onehot_einsum,
+                                     (_log_addn_behind_onehot_einsum_pred,))
 
 ## canonicalizing einsums
 
@@ -404,28 +491,6 @@ add_powers_within_einsum = Rule((Einsum, Str('formula'), Segment('args1'),
                                 (_add_powers_within_einsum_pred,))
 
 
-def _is_small_positive_integer(x, threshold=5):
-  return x > 0 and np.floor(x) == x and x < threshold
-
-
-def _expand_integer_power_in_einsum(formula, x, exponent, args1, args2):
-  in_formulas, out_formula = split_einsum_formula(formula)
-  return np.einsum(_reconstitute_einsum_formula(
-      in_formulas[:len(args1)] + [in_formulas[len(args1)],] * exponent +
-      in_formulas[len(args1)+1:], out_formula),
-                   *(args1 + (x,) * exponent + args2))
-
-
-# TODO(mhoffman): Add predicates that make sure formulas match.
-expand_integer_power_in_einsum = Rule((Einsum, Str('formula'),
-                                       Segment('args1'),
-                                       (Power, Node('x'),
-                                        Scalar('exponent',
-                                               _is_small_positive_integer)),
-                                       Segment('args2')),
-                                      _expand_integer_power_in_einsum)
-
-
 def _increment_negative_power_in_einsum_r(formula, x, exponent,
                                           args1, args2, args3):
   in_formulas, out_formula = split_einsum_formula(formula)
@@ -470,12 +535,33 @@ _einsum_composition_pat = \
      Segment('args2'))
 
 
-def _compose_einsums(
-    formula, args1, args2, parent_formula, parent_args):
-  i = len(args1)
-  in_formulas, out_formula = split_einsum_formula(formula)
+def decompose_formula(formula):
+  """Given a string of indices for an argument to an einsum, returns a list
+  of the letters used, with '...' treated as an atomic letter.
+  """
+  formula = formula.replace('...', '.')
+  decomposed = []
+  for idx in formula:
+    if idx == '.':
+      decomposed.append('...')
+    else:
+      decomposed.append(idx)
+  return decomposed
+
+
+def _compose_einsums(formula, args1, args2, parent_formula, parent_args):
+  parent_formula = debroadcast_formula(parent_formula,
+                                       *[np.ndim(arg) for arg in parent_args])
   parent_in_formulas, parent_out_formula = split_einsum_formula(parent_formula)
 
+  parent_ndim = len(parent_out_formula)
+  arg_ndims = ([np.ndim(arg) for arg in args1] +
+              [parent_ndim] +
+              [np.ndim(arg) for arg in args2])
+  formula = debroadcast_formula(formula, *arg_ndims)
+  in_formulas, out_formula = split_einsum_formula(formula)
+
+  i = len(args1)
   if len(parent_out_formula) != len(in_formulas[i]):
     raise ValueError('Input formula {} and parent formula {} have'
                      ' inconsistent numbers of indexes, broadcasting'

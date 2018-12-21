@@ -133,8 +133,11 @@ class ExprNode(Node):
             and all(equal(self.kwargs[k], x.kwargs[k]) for k in self.kwargs))
 
   def __repr__(self):
+    node_name = self.fun.__name__
+    if self.fun is env_lookup:
+      node_name += '(' + self.name + ')'
     return '<ExprNode {}({}) {}>'.format(
-        self.fun.__name__, ', '.join(['-'] * len(self.args)), hex(id(self)))
+        node_name, ', '.join(['-'] * len(self.args)), hex(id(self)))
 
 
 def env_lookup(env, var_name):
@@ -205,6 +208,47 @@ def _eval_graph(root_node, eval_args, apply_node, cse=True):
     vals[node] = apply_node(node, args)
   return vals[root_node]
 
+def node_fmap(f, xs):
+  if isinstance(xs, ExprNode):
+    return f(xs)
+  elif isinstance(xs, (list, tuple)):
+    elts = [node_fmap(f, elt) for elt in xs]
+    # assume there are no tuple subclasses other than namedtuples
+    if type(xs) in (list, tuple):
+      return type(xs)(elts)
+    else:
+      return type(xs)(*elts)  # namedtuple
+  elif isinstance(xs, dict):
+    return {k: node_fmap(f, v) for k, v in xs.items()}
+  else:
+    return xs
+
+class ContainerOutput(object):
+  def __init__(self, container):
+    self.container = container
+
+  def __hash__(self):
+    return id(self.container)  # unique value
+
+  @property
+  def parents(self):
+    nodes = set()
+    node_fmap(nodes.add, self.container)
+    return nodes
+
+def _eval_graph_container(root_container, eval_args, apply_node, cse=True):
+  # This function exists to handle root nodes that are container types.
+  graph = list(toposort(ContainerOutput(root_container)))[::-1]
+
+  vals = {}
+  apply_node = _memoize_apply_node(apply_node) if cse else apply_node
+  for node in graph[:-1]:
+    args = eval_args(node, (vals[p] for p in node.parents))
+    vals[node] = apply_node(node, args)
+  out = node_fmap(vals.get, root_container)
+  import pdb; pdb.set_trace()
+  return out
+
 
 def eval_expr(expr, env={}):
   """Evaluate an expression in a given environment.
@@ -235,92 +279,16 @@ def eval_expr(expr, env={}):
         return fun(env, *node_args, **node.kwargs)
       else:
         return fun(*node_args, **node.kwargs)
-    return _eval_graph(expr.expr_node, eval_args, apply_node)
+    if isinstance(expr.expr_node, tuple):
+      return _eval_graph_container(expr.expr_node, eval_args, apply_node)
+    else:
+      return _eval_graph(expr.expr_node, eval_args, apply_node)
   else:
     raise TypeError("Can't evaluate expression type: {}".format(type(expr)))
 
 
 def eval_node(node, free_vars, env):
   return eval_expr(GraphExpr(node, free_vars), env)
-
-
-def _eval_perturbed(expr, perturbations, env={}, stop_nodes=()):
-  def eval_args(node, partial_args):
-    return subvals(node.args, zip(node.parent_argnums, partial_args))
-  def apply_node(node, node_args):
-    if node.fun is env_lookup:
-      val = node.fun(env, *node_args, **node.kwargs)
-    else:
-      val = node.fun(*node_args, **node.kwargs)
-
-    if node in stop_nodes:
-      val = getval(val)
-    if node in perturbations:
-      val = val + perturbations[node]
-    return val
-  return _eval_graph(expr.expr_node, eval_args, apply_node)
-
-
-# def grad_expr(expr, wrt_nodes, stop_nodes=()):
-#   """Returns function to evaluate the grad of expr with respect to wrt_nodes.
-
-#   Args:
-#     expr: an expression instance.
-#     wrt_nodes: a list of expression nodes.
-#     stop_nodes: optional, a list of nodes to treat as constant (default []).
-
-#   Returns:
-#     A function that takes positional arguments corresponding to expr.free_vars
-#     and returns a list of values with the same shapes (vspaces) as wrt_nodes.
-#   """
-#   if isinstance(expr, ConstExpr):
-#     zero_result = {node: node.vs.zeros() for node in wrt_nodes}
-#     return lambda *args: zero_result
-#   elif isinstance(expr, GraphExpr):
-#     def gradfun(*args):
-#       fun = lambda *args: eval_expr(expr, dict(zip(wrt_nodes, args)))
-#       start_nodes = [ag_core.VJPNode.new_root() for _ in wrt_nodes]
-#       out, end_node = trace(fun, start_nodes, args)
-#       return backward_pass(vspace(out).ones(), start_nodes, end_node)
-#     return gradfun
-#   else:
-#     raise TypeError("Can't grad expression type: {}".format(type(expr)))
-
-
-
-def grad_expr(expr, wrt_nodes, stop_nodes=()):
-  """Returns function to evaluate the grad of expr with respect to wrt_nodes.
-
-  Args:
-    expr: an expression instance.
-    wrt_nodes: a list of expression nodes.
-    stop_nodes: optional, a list of nodes to treat as constant (default []).
-
-  Returns:
-    A function that takes positional arguments corresponding to expr.free_vars
-    and returns a list of values with the same shapes (vspaces) as wrt_nodes.
-  """
-  if isinstance(expr, ConstExpr):
-    zero_result = {node: node.vs.zeros() for node in wrt_nodes}
-    return lambda *args: zero_result
-  elif isinstance(expr, GraphExpr):
-    def perturbed_fun(*args):
-      h, x = args[:len(wrt_nodes)], args[len(wrt_nodes):]
-      env = dict(zip(expr.free_vars.keys(), x))
-      perturbations = dict(zip(wrt_nodes, h))
-      return _eval_perturbed(expr, perturbations, env, stop_nodes)
-    def gradfun(*args):
-      perturbations = [node.vs.zeros() for node in wrt_nodes]
-      all_args = perturbations + list(args)
-      start_nodes = [ag_core.VJPNode.new_root()
-                     for _ in itertools.chain(wrt_nodes, args)]
-      out, end_node = trace(perturbed_fun, start_nodes, all_args)
-      grads = backward_pass(vspace(out).ones(), start_nodes, end_node)
-      return [g if g is not None else node.vs.zeros()
-              for g, node in zip(grads, wrt_nodes)]
-    return gradfun
-  else:
-    raise TypeError("Can't grad expression type: {}".format(type(expr)))
 
 
 def backward_pass(g, start_nodes, end_node):

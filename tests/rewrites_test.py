@@ -132,6 +132,26 @@ class RewritesTest(NumericalTestCase):
                                             4.7 * np.ones([3, 4, 5]))
     self.assertEqual(expr.expr_node.fun.__name__, 'power')
 
+  def testPowerRewriter(self):
+    x = npr.randn(10)
+
+    fun = lambda x: x**0
+    expr = self._eager_rewriter_test_helper(fun, rewrites.maybe_power, x)
+    self.assertIsInstance(expr, tracers.ConstExpr)
+    self.assertEqual(expr.val, 1)
+
+    fun = lambda x: x**1
+    expr = self._eager_rewriter_test_helper(fun, rewrites.maybe_power, x)
+    self.assertEqual(expr.expr_node.fun.__name__, 'env_lookup')
+
+    fun = lambda x: x**4
+    expr = self._eager_rewriter_test_helper(fun, rewrites.maybe_power, x)
+    self.assertEqual(expr.expr_node.fun.__name__, 'einsum')
+
+    fun = lambda x: x**-1
+    expr = self._eager_rewriter_test_helper(fun, rewrites.maybe_power, x)
+    self.assertEqual(expr.expr_node.fun.__name__, 'power')
+
   def testAddRewriter(self):
     x = npr.randn(4, 3)
     y = npr.randn(3)
@@ -338,6 +358,14 @@ class RewritesTest(NumericalTestCase):
 
   def testLogEinsumRewriter(self):
 
+    # TODO(matthewjmackay): fails on example below where axes are transposed
+#     def fun(x, y):
+#       return np.log(np.einsum('ji,ij->ij', x, y))
+#
+#     x = np.exp(npr.randn(3, 4))
+#     y = np.exp(npr.randn(4, 3))
+#     z = np.exp(npr.randn(4))
+
     def fun(x, y):
       return np.log(np.einsum('ij,ij->ij', x, y))
 
@@ -492,19 +520,6 @@ class RewritesTest(NumericalTestCase):
     self.assertTrue(any([node.fun == np.power and node.args[1] == 4
                          for node in expr.expr_node.parents]))
 
-  def testExpandIntegerPowerInEinsum(self):
-    x = npr.randn(10)
-
-    def fun(x):
-      return np.einsum(',a->', 3., x ** 3)
-
-    expr = self._rewriter_test_helper(
-        fun, rewrites.expand_integer_power_in_einsum, x)
-    self.assertEqual(expr.expr_node.fun, np.einsum)
-    self.assertEqual(len(expr.expr_node.args), 5)
-    for node in expr.expr_node.parents:
-      self.assertEqual(node.fun, tracers.env_lookup)
-
   def testIncrementNegativePowerInEinsum(self):
     x = npr.randn(10)
 
@@ -535,12 +550,17 @@ class RewritesTest(NumericalTestCase):
     self.assertEqual(
         rewrites._rename_formula_indices('...ikj->...jk'), '...abc->...cb')
 
-  def testRemoveEllipsis(self):
+  def testDebroadcastFormula(self):
     self.assertEqual(
-        rewrites._remove_ellipsis('...i,...j->...', [np.ones(5), np.ones(3)]), 'a,b->')
+        rewrites.debroadcast_formula('...i,...j->...', *[1, 1]), 'a,b->')
     self.assertEqual(
-        rewrites._remove_ellipsis('...i,...j->...',
-                         [np.ones([10, 5]), np.ones([10, 3])]),'ab,ac->a')
+        rewrites.debroadcast_formula('...i,...j->...', *[2, 2]), 'ab,ac->a')
+    # _remove_ellipsis would fail this test
+    self.assertEqual(
+        rewrites.debroadcast_formula('...,...->...', *[1, 1]), 'a,a->a')
+    self.assertEqual(
+        rewrites.debroadcast_formula(
+            '...a,...b->...ab', *[2, 3]), 'ab,cad->cabd')
 
   def testEinsumRepeatedOneHot(self):
     x = npr.randn(3, 2)

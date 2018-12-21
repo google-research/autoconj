@@ -21,6 +21,7 @@ import autograd.extend as ag_extend
 import autograd.util as ag_util
 from autograd.numpy.numpy_vspaces import ArrayVSpace
 import autograd.numpy as np
+import autograd.numpy.numpy_boxes as np_boxes
 
 from . import tracers
 
@@ -105,9 +106,12 @@ def _import_primitives_no_clobber(new, old):
 
 _import_primitives_no_clobber(globals(), np.__dict__)
 _import_primitives_no_clobber(globals(), np.linalg.__dict__)
+_import_primitives_no_clobber(globals(), np_boxes.ArrayBox.__dict__)
 _import_primitives_no_clobber(globals(), {'add_n': tracers.add_n})
 _import_primitives_no_clobber(globals(), {'logdet': tracers.logdet})
 _import_primitives_no_clobber(globals(), {'one_hot': tracers.one_hot})
+EnvLookup = _make_primitive_pattern(tracers.env_lookup, 'EnvLookup')
+
 
 ## patterns for Autograd internals
 

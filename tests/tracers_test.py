@@ -137,43 +137,6 @@ class TracersTest(absltest.TestCase):
     self.assertEqual(3 * 6 ** 6 + 7,
                      tracers.eval_expr(expr, {'x': 6, 'y': 7}))
 
-  def testEvalPerturbed(self):
-
-    def f(x, y):
-      return 2 * x ** 2 + y
-
-    expr = tracers.make_expr(f, 1, 2)
-    node = expr.expr_node.parents[0].parents[0]  # x ** 2
-
-    self.assertEqual(2 * (4 ** 2 + 3) + 5,
-                     tracers._eval_perturbed(expr, {node: 3}, {'x': 4, 'y': 5}))
-
-    node = expr.free_vars['x']
-    self.assertEqual(2 * (4 + 3) ** 2 + 5,
-                     tracers._eval_perturbed(expr, {node: 3}, {'x': 4, 'y': 5}))
-
-  def testGradExpr(self):
-
-    def f(x, y):
-      return 2 * x ** 2 + y
-
-    expr = tracers.make_expr(f, 1., 2.)
-    node = expr.expr_node.parents[0].parents[0]  # x ** 2
-    gradfun = tracers.grad_expr(expr, [node])
-
-    self.assertEqual([2.], gradfun(4., 5.))
-
-  def testGradExprNonlinear(self):
-
-    def f(x, y):
-      return 2 * x ** 2 + y
-
-    expr = tracers.make_expr(f, 1., 2.)
-    node = expr.free_vars['x']  # x
-    gradfun = tracers.grad_expr(expr, [node])
-
-    self.assertEqual([2. * 2. * 4.], gradfun(4., 5.))
-
   def testUnusedVars(self):
 
     def f(x, y, z):

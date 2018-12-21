@@ -17,9 +17,9 @@ from __future__ import print_function
 
 from autoconj.canonicalize import canonicalize
 from autoconj.conjugacy import (
-    complete_conditional, _extract_conditional_factors,
-    find_sufficient_statistic_nodes, marginalize, split_einsum_node,
-    split_einsum_node2, SupportTypes, multilinear_representation)
+    complete_conditional, find_sufficient_statistic_nodes, marginalize,
+    split_einsum_node, SupportTypes, statistic_representation,
+    make_initializers, grad_namedtuple)
 from autoconj.exponential_families import batch_dirichlet
 from autoconj.tracers import (eval_expr, eval_node, one_hot, print_expr,
                               make_expr, GraphExpr, logdet)
@@ -119,92 +119,15 @@ class ConjugacyTest(absltest.TestCase):
     f = lambda x, y: np.einsum('i,i->', x, y)
     node = make_expr(f, *args)
     val = f(*args)
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [0])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [0])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env), x))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [1])
+
+    potential_node, stat_node = split_einsum_node(node.expr_node, [1])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env), y))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    # TODO(mattjj): these next lines fail because param_inputs == []
-    # potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [0, 1])
-    # self.assertTrue(np.allclose(eval_node(stat_node, node, env), x * y))
-    # self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
 
-    args = (x, y)
-    f = lambda x, y: np.einsum('i,i,i->', x, y, y)
-    node = make_expr(f, *args)
-    val = f(*args)
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [1, 2])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env), y * y))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [0])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env), x))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-
-    args = (x,)
-    f = lambda x: np.einsum('i,i,i->', np.ones_like(x), x, x)
-    node = make_expr(f, *args)
-    val = f(*args)
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [1, 2])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env), x * x))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-
-    args = (matrix, x, y)
-    f = lambda matrix, x, y: np.einsum('ij,i,j->', matrix, x, y)
-    node = make_expr(f, *args)
-    val = f(*args)
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [1, 2])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env),
-                                np.outer(x, y)))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [0])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env), matrix))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-
-    args = (matrix, x, y)
-    f = lambda matrix, x, y: np.einsum('i,j,ki,kj->', x, x, matrix, matrix)
-    node = make_expr(f, *args)
-    val = f(*args)
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [2, 3])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env),
-                                matrix[:, None, :] * matrix[:, :, None]))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [0, 1])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env),
-                                np.outer(x, x)))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-
-    args = (matrix, x, y)
-    f = lambda matrix, x, y: np.einsum(',kj,j,ka,a->', -0.5, matrix, x,
-                                       matrix, y)
-    node = make_expr(f, *args)
-    val = f(*args)
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [2, 4])
-    self.assertEqual(stat_node.args[0], 'j,a->ja')
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node, grad_node = split_einsum_node(node.expr_node, [0, 1, 3])
-    self.assertEqual(stat_node.args[0], ',kj,ka->kja')
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-
-  def testSplitEinsumNode2(self):
-    n_dimensions = 5
-    x = np.random.randn(n_dimensions)
-    y = np.random.randn(n_dimensions)
-    matrix = np.random.randn(n_dimensions, n_dimensions)
-
-    env = {'x': x, 'y': y, 'matrix': matrix}
-
-    args = (x, y)
-    f = lambda x, y: np.einsum('i,i->', x, y)
-    node = make_expr(f, *args)
-    val = f(*args)
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [0])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env), x))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [1])
-    self.assertTrue(np.allclose(eval_node(stat_node, node, env), y))
-    self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [0, 1])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [0, 1])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env), x * y))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
 
@@ -212,10 +135,10 @@ class ConjugacyTest(absltest.TestCase):
     f = lambda x, y: np.einsum('i,i,i->', x, y, y)
     node = make_expr(f, *args)
     val = f(*args)
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [1, 2])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [1, 2])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env), y * y))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [0])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [0])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env), x))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
 
@@ -223,7 +146,7 @@ class ConjugacyTest(absltest.TestCase):
     f = lambda x: np.einsum('i,i,i->', np.ones_like(x), x, x)
     node = make_expr(f, *args)
     val = f(*args)
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [1, 2])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [1, 2])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env), x * x))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
 
@@ -231,11 +154,11 @@ class ConjugacyTest(absltest.TestCase):
     f = lambda matrix, x, y: np.einsum('ij,i,j->', matrix, x, y)
     node = make_expr(f, *args)
     val = f(*args)
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [1, 2])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [1, 2])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env),
                                 np.outer(x, y)))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [0])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [0])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env), matrix))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
 
@@ -243,11 +166,11 @@ class ConjugacyTest(absltest.TestCase):
     f = lambda matrix, x, y: np.einsum('i,j,ki,kj->', x, x, matrix, matrix)
     node = make_expr(f, *args)
     val = f(*args)
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [2, 3])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [2, 3])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env),
                                 matrix[:, None, :] * matrix[:, :, None]))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [0, 1])
+    potential_node, stat_node = split_einsum_node(node.expr_node, [0, 1])
     self.assertTrue(np.allclose(eval_node(stat_node, node, env),
                                 np.outer(x, x)))
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
@@ -257,12 +180,15 @@ class ConjugacyTest(absltest.TestCase):
                                        matrix, y)
     node = make_expr(f, *args)
     val = f(*args)
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [2, 4], False)
+
+    potential_node, stat_node = split_einsum_node(node.expr_node, [2, 4], False)
     self.assertEqual(stat_node.args[0], 'j,a->ja')
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
-    potential_node, stat_node = split_einsum_node2(node.expr_node, [0, 1, 3], False)
+
+    potential_node, stat_node = split_einsum_node(node.expr_node, [0, 1, 3], False)
     self.assertEqual(stat_node.args[0], ',kj,ka->kja')
     self.assertTrue(np.allclose(eval_node(potential_node, node, env), val))
+
 
   def testConditionAndMarginalizeZeroMeanScalarNormal(self):
     def log_joint(x, precision):
@@ -270,12 +196,13 @@ class ConjugacyTest(absltest.TestCase):
     x = np.random.randn()
     precision = np.exp(np.random.randn())
 
-    conditional, marginalized_value = _condition_and_marginalize(
-        log_joint, 0, SupportTypes.REAL, x, precision)
+    conditional, marginalized_value = _condition_and_marginalize(log_joint, 0,
+                                                                 SupportTypes.REAL,
+                                                                 x, precision)
     correct_marginalized_value = (-0.5 * np.log(precision)
                                   + 0.5 * np.log(2. * np.pi))
-    self.assertAlmostEqual(correct_marginalized_value, marginalized_value)
 
+    self.assertAlmostEqual(correct_marginalized_value, marginalized_value)
     self.assertEqual(0, conditional.args[0])
     self.assertEqual(1. / np.sqrt(precision), conditional.args[1])
 
@@ -330,8 +257,8 @@ class ConjugacyTest(absltest.TestCase):
                                                                  x, precision)
     correct_marginalized_value = (-0.5 * np.linalg.slogdet(precision)[1]
                                   + 0.5 * n_dimensions * np.log(2. * np.pi))
-    self.assertAlmostEqual(correct_marginalized_value, marginalized_value)
 
+    self.assertAlmostEqual(correct_marginalized_value, marginalized_value)
     self.assertTrue(np.allclose(np.zeros(n_dimensions), conditional.mean))
     self.assertTrue(np.allclose(np.linalg.inv(precision), conditional.cov))
 
@@ -690,17 +617,14 @@ class ConjugacyTest(absltest.TestCase):
     self.assertTrue(_match_values(sufficient_statistics,
                                   correct_sufficient_statistics))
 
-    _, natural_parameter_funs = _extract_conditional_factors(graph, 'beta')
-    self.assertTrue(_match_values(natural_parameter_funs.keys(),
-                                  ['x', 'einsum(...a,...b->...ab, x, x)',
-                                   'einsum(...,...->..., x, x)'],
-                                  lambda x, y: x == y))
-    natural_parameter_vals = [f(X, beta, y) for f in
-                              natural_parameter_funs.values()]
-    correct_parameter_vals = [-0.5 * np.ones(n_predictors), -0.5 * X.T.dot(X),
-                              y.dot(X)]
-    self.assertTrue(_match_values(natural_parameter_vals,
-                                  correct_parameter_vals))
+    new_log_joint, _, stats_funs, _ = (
+        statistic_representation(log_joint, (X, beta, y),
+                               (SupportTypes.REAL,), (1,)))
+    beta_stat_fun = stats_funs[0]
+    beta_natparam = grad_namedtuple(new_log_joint, 1)(X, beta_stat_fun(beta), y)
+    correct_beta_natparam = (-0.5 * X.T.dot(X), y.dot(X),
+                             -0.5 * np.ones(n_predictors))
+    self.assertTrue(_match_values(beta_natparam, correct_beta_natparam))
 
     conditional_factory = complete_conditional(log_joint, 1, SupportTypes.REAL,
                                                X, beta, y)
@@ -854,7 +778,7 @@ class ConjugacyTest(absltest.TestCase):
     self.assertAlmostEqual(true_a, conditional.args[0])
     self.assertAlmostEqual(true_b, 1. / conditional.args[2])
 
-  def testMultilinearRepresentation(self):
+  def testStatisticRepresentation(self):
 
     A = np.array([[1., 0], [0., 1.], [1., 1.]])
     Sigma = 2 * np.eye(3)
@@ -864,21 +788,23 @@ class ConjugacyTest(absltest.TestCase):
     def log_joint(z, x):
       log_prior = -1./2 * np.dot(z, z)
       centered = x - np.dot(A, z)
-      log_like = -1./2 * np.dot(centered, np.dot(np.linalg.inv(Sigma), centered)) \
-          - 1./2 * logdet(Sigma)
+      log_like = (-1./2 * np.dot(centered, np.dot(np.linalg.inv(Sigma), centered))
+          - 1./2 * logdet(Sigma))
       return log_prior + log_like
 
-    neg_energy, normalizers, _, initializers, _, samplers = \
-        multilinear_representation(log_joint, (z, x),
-                                   (SupportTypes.REAL, SupportTypes.REAL))
+    neg_energy, normalizers, stats_funs, samplers = (
+        statistic_representation(log_joint, (z, x),
+                                 (SupportTypes.REAL, SupportTypes.REAL)))
+    initializers, _ = make_initializers((z,x), neg_energy, normalizers,
+                                        stats_funs)
 
     # just check that these don't crash
     natparams = [initializer() for initializer in initializers]
     neg_energy(*natparams)
-    [sampler(*natparam).rvs() for sampler, natparam in zip(samplers, natparams)]
+    [sampler(natparam).rvs() for sampler, natparam in zip(samplers, natparams)]
 
     expected_post_mu = A.T.dot(x / 2.)
-    computed_post_mu = grad(normalizers[0])(initializers[0]())[-1]
+    computed_post_mu = grad_namedtuple(normalizers[0])(initializers[0]()).x
     self.assertTrue(np.allclose(expected_post_mu, computed_post_mu))
 
 

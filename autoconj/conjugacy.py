@@ -29,12 +29,11 @@ from autograd import make_vjp
 from autograd import grad
 
 from .canonicalize import canonicalize, hierarchy_level, NodeTypes
-from .exponential_families import (canonical_statistic_strs, suff_stat_to_dist,
-                                   suff_stat_to_log_normalizer)
+from .exponential_families import find_distributions, exp_family_stats
 from .tracers import (all_descendants_of, ConstExpr, draw_expr, env_lookup ,
                       eval_expr, eval_node, ExprNode, extract_superexpr,
-                      grad_expr, GraphExpr, is_descendant_of, make_expr,
-                      make_node, _mutate_node, print_expr, remake_expr)
+                      GraphExpr, is_descendant_of, make_expr, make_node,
+                      _mutate_node, print_expr, remake_expr, subvals)
 from .util import split_einsum_formula, support_type_to_name,  SupportTypes
 
 
@@ -96,7 +95,7 @@ def find_sufficient_statistic_nodes(expr, free_var, split_einsums=False):
         if split_einsums:
           argnums = [i for i, a in enumerate(node.args[1:])
                      if isinstance(a, ExprNode) and a in desc]
-          potential_node, stat_node = split_einsum_node2(node, argnums)
+          potential_node, stat_node = split_einsum_node(node, argnums)
           _mutate_node(node, potential_node)  # mutates node and hence expr too
           suff_stats.add(stat_node)
         else:
@@ -132,58 +131,30 @@ def _canonicalize_einsum_formula(formula):
                                              out_formula))
 
 
-def _summarize_node(node, wrt_node=None):
-  if not isinstance(node, ExprNode):
-    return '{}'.format(node)
-  if node.fun is env_lookup:
-    if node != wrt_node:
-      return 'arg_{}'.format(node.args[0])
-    else:
-      return 'x'
-  arg_summaries = [_summarize_node(arg, wrt_node) for arg in node.args]
-  if node.fun.__name__ == 'einsum':
-    arg_summaries[0] = _canonicalize_einsum_formula(arg_summaries[0])
-  if node.fun.__name__ == 'one_hot':
-    arg_summaries = arg_summaries[0]  # Don't record `width` parameter.
-  return '{}({})'.format(node.fun.__name__, ', '.join(arg_summaries))
-
-
-def _zero_out_node(node):
-  zeros = node.vs.zeros()
-  node.fun = lambda *args: zeros
-
-
-def _trace_and_analyze(log_joint_fun, argid, *args):
-  graph = make_expr(log_joint_fun, *args)
-  args = graph.free_vars
-  graph = canonicalize(graph)
-  sufficient_statistic_nodes, natural_parameter_funs = (
-      _extract_conditional_factors(graph, argid))
-  return graph, sufficient_statistic_nodes, natural_parameter_funs
+def make_zeros(stat):
+  if stat.__class__ in exp_family_stats:
+    return stat.__class__(**{name: make_zeros(v)
+                             for name, v in stat._asdict().iteritems()})
+  elif isinstance(stat, tuple):
+    return tuple([make_zeros(item) for item in stat])
+  elif isinstance(stat, dict):
+    return {k: make_zeros(v) for k, v in stat.iteritems()}
+  else:
+    return np.zeros_like(stat)
 
 
 # TODO(mattjj): revise to use inline_expr and replace_node_with_expr
 def marginalize(log_joint_fun, argnum, support, *args):
-  graph, sufficient_statistic_nodes, natural_parameter_funs = (
-      _trace_and_analyze(log_joint_fun, argnum, *args))
-  natural_parameter_factory = (
-      _get_natural_parameter_factory(natural_parameter_funs, support))
-
-  key, _ = natural_parameter_factory(*args)
-  log_normalizer = suff_stat_to_log_normalizer[support][key]
-
-  for node in sufficient_statistic_nodes:
-    # TODO(mhoffman): Actually remove the node. This should work for now.
-    _zero_out_node(node)
+  new_log_joint_fun, log_normalizers, stats_funs, _ = (
+      statistic_representation(log_joint_fun, args, (support,), (argnum,)))
+  log_normalizer, stat_fun = log_normalizers[0], stats_funs[0]
+  stat_zeros = make_zeros(stat_fun(args[argnum]))
 
   def marginalized_log_prob(*new_args):
-    new_args = new_args[:argnum] + (0,) + new_args[argnum:]
-
-    argnames = graph.free_vars.keys()
-    env = {argnames[i]: new_args[i] for i in range(len(new_args))}
-    log_joint = eval_expr(graph, env)
-    natural_parameters = natural_parameter_factory(*new_args)[1]
-    log_normalizer_val = log_normalizer(*natural_parameters)
+    new_args = new_args[:argnum] + (stat_zeros,) + new_args[argnum:]
+    log_joint = new_log_joint_fun(*new_args)
+    natural_parameters = grad_namedtuple(new_log_joint_fun, argnum)(*new_args)
+    log_normalizer_val = log_normalizer(natural_parameters)
     return log_joint + log_normalizer_val
 
   return marginalized_log_prob
@@ -209,40 +180,37 @@ def complete_conditional(log_joint_fun, argnum, support, *args):
   """
   # TODO(mhoffman): Make it possible to pass multiple argnums and
   # return multiple conditionals.
-  _, _, natural_parameter_funs = (
-      _trace_and_analyze(log_joint_fun, argnum, *args))
+  new_log_joint_fun, log_normalizers, stats_funs, distbns = (
+      statistic_representation(log_joint_fun, args, (support,),  (argnum,)))
+  log_normalizer, stat_fun, distbn = (
+      log_normalizers[0], stats_funs[0],distbns[0])
+  stat_zeros = make_zeros(stat_fun(args[argnum]))
 
-  natural_parameter_factory = (
-      _get_natural_parameter_factory(natural_parameter_funs, support))
   def conditional_factory(*new_args):
-    new_args = new_args[:argnum] + (args[argnum],) + new_args[argnum:]
-    key, natural_parameters = natural_parameter_factory(*new_args)
-    return suff_stat_to_dist[support][key](*natural_parameters)
+    new_args = new_args[:argnum] + (stat_zeros,) + new_args[argnum:]
+    natural_parameters = grad_namedtuple(new_log_joint_fun, argnum)(*new_args)
+    return distbn(natural_parameters)
   return conditional_factory
 
 
-def multilinear_representation(log_joint_fun, args, supports):
+def statistic_representation(log_joint_fun, args, supports, argnums=None):
+  if argnums is None:
+    argnums = range(len(args))
+  # TODO(mattjj): add optimization to not always split the einsum node
   expr = _split_einsum_stats(canonicalize(make_expr(log_joint_fun, *args)))
+  names = [expr.free_vars.keys()[argnum] for argnum in argnums]
+  stats_nodes = [find_sufficient_statistic_nodes(expr, name) for name in names]
+  stats_nodes, log_normalizers, distbns = (
+      find_distributions(stats_nodes, supports))
 
-  stats_nodes, keys = [], []
-  for name, free_node in expr.free_vars.iteritems():
-    nodes = find_sufficient_statistic_nodes(expr, name)
-    names = (_summarize_node(node, free_node) for node in nodes)
-    key, nodes = zip(*sorted(zip(names, nodes)))
-    stats_nodes.append(nodes)
-    keys.append(key)
-
-  neg_energy = _make_neg_energy(expr, stats_nodes, supports)
-
-  make_normalizer_fun = (lambda key, support: lambda arg:
-                         suff_stat_to_log_normalizer[support][key](*arg))
-  normalizers = map(make_normalizer_fun, keys, supports)
-
+  new_log_joint_fun = _make_stat_log_joint(expr, argnums, stats_nodes, supports)
   make_stat_fun = (lambda name, nodes: lambda arg:
-                   tuple(eval_node(node, expr.free_vars, {name: arg})
-                         for node in nodes))
-  stats_funs = map(make_stat_fun, expr.free_vars, stats_nodes)
+                   eval_node(nodes, expr.free_vars, {name: arg}))
+  stats_funs = map(make_stat_fun, names, stats_nodes)
+  return new_log_joint_fun, log_normalizers, stats_funs, distbns
 
+
+def make_initializers(args, neg_energy, normalizers, stats_funs):
   stats_vals = [stat_fun(arg) for stat_fun, arg in zip(stats_funs, args)]
   make_nat_init = (lambda i: lambda scale=1.:
                    make_vjp(neg_energy, i)(*stats_vals)[0](scale))
@@ -251,11 +219,7 @@ def multilinear_representation(log_joint_fun, args, supports):
                    grad(normalizer)(make_vjp(neg_energy, i)(*stats_vals)[0](scale)))
   mean_initializers = map(make_mean_init, enumerate(normalizers))
 
-  samplers = [suff_stat_to_dist[support][key]
-              for key, support in zip(keys, supports)]
-
-  return (neg_energy, normalizers, stats_funs, natural_initializers,
-          mean_initializers, samplers)
+  return natural_initializers, mean_initializers
 
 
 def _split_einsum_stats(expr):
@@ -265,26 +229,36 @@ def _split_einsum_stats(expr):
   return remake_expr(expr)  # common-subexpression elimination
 
 
-def _make_neg_energy(expr, nodes, supports):
-  names = tuple('t_{name}'.format(name=name) for name in expr.free_vars)
+def flat_dict(stats):
+  stats_dict = {}
 
-  def flat_dict(groups):
-    return {'{name}_{idx}'.format(name=name, idx=idx): item
-            for name, item_group in zip(names, groups)
-            for idx, item in enumerate(item_group)}
+  def add_to_dict(item, name_so_far):
+    if item.__class__ in exp_family_stats:
+      for subname, subitem in item._asdict().iteritems():
+        add_to_dict(subitem, name_so_far + '_' + subname)
+    elif isinstance(item, tuple) or isinstance(item, list):
+      for subname, subitem in enumerate(item):
+        add_to_dict(subitem, name_so_far + '_' + str(subname))
+    elif isinstance(item, dict):
+      for subname, subitem in item.iteritems():
+        add_to_dict(subitem, name_so_far + '_' + str(subname))
+    elif item is not None:
+      stats_dict[name_so_far] = item
 
-  g_expr = extract_superexpr(expr, flat_dict(nodes))
-  g_raw = lambda *args: eval_expr(g_expr, flat_dict(args))
+  add_to_dict(stats, '')
+  return stats_dict
+
+
+def _make_stat_log_joint(expr, argnums, stats_nodes, supports):
+  names = tuple(expr.free_vars.keys())
+  g_expr = extract_superexpr(expr, flat_dict(stats_nodes))
+  def construct_env(args):
+    env = {name: arg for i, (name, arg)
+           in enumerate(zip(names, args)) if i not in argnums}
+    flat_stats_dict = flat_dict([args[argnum] for argnum in argnums])
+    return dict(env, **flat_stats_dict)
+  g_raw = lambda *args: eval_expr(g_expr, construct_env(args))
   g = make_fun(g_raw, name='neg_energy', varnames=names)
-
-  arg_docs = ("{argname}: {support} with shape {shape}"
-              .format(argname=name, shape=tuple(n.vs.shape for n in node_group),
-                      support=support_type_to_name[support].title())
-              for name, node_group, support in zip(names, nodes, supports))
-  g.__doc__ = """\
-      Negative energy function on statistics.\n
-      Args:
-        {arg_docs}\n""".format(arg_docs="\n        ".join(arg_docs))
   return g
 
 
@@ -298,92 +272,7 @@ def make_fun(fun, **kwargs):
   return FunctionType(new_code, fun.func_globals, closure=fun.func_closure)
 
 
-def _stat_nodes_to_key(nodes, free_node):
-  summaries = (_summarize_node(node, free_node) for node in nodes)
-  key, _ = canonical_statistic_strs(summaries)
-  return key
-
-
-def _get_natural_parameter_factory(natural_parameter_funs, support):
-  key, order = canonical_statistic_strs(natural_parameter_funs.keys())
-  if key not in suff_stat_to_dist[support]:
-    raise NotImplementedError('Conditional distribution has sufficient '
-                              'statistics {}, but no available '
-                              'exponential-family distribution with support '
-                              '{} has those sufficient statistics.'.format(
-                                  key, support_type_to_name[support]))
-  def natural_parameter_factory(*args):
-    natural_parameters = [f(*args) for f in natural_parameter_funs.values()]
-    natural_parameters = [natural_parameters[i] for i in order]
-    return key, natural_parameters
-  return natural_parameter_factory
-
-
-def _extract_conditional_factors(log_joint_node, wrt_argid):
-  """Determines a node's natural parameters and sufficient statistics.
-
-  If `log_joint_node` defines a log-joint distribution of some random
-  variables (including `wrt_node`), and the conditional distribution
-  p(wrt_node | everything else) is in an exponential family, then this
-  function will try to determine the sufficient statistics and natural
-  parameters of that exponential family distribution.
-
-  Args:
-    log_joint_node: An ExprNode that computes a log-joint function.
-    wrt_argname: string or int indicating which input to the log-joint is of the
-      random variable of interest.
-
-  Returns:
-    natural_parameter_funs: A dictionary that maps from a string describing
-      a sufficient-statistic function to a function f(*args) that takes the
-      same arguments as the log-joint and computes the natural parameter array
-      that corresponds to the sufficient statistic key.
-  """
-  if isinstance(wrt_argid, str):
-    wrt_node = log_joint_node.free_vars[wrt_argid]
-  else:
-    wrt_node = log_joint_node.free_vars.values()[wrt_argid]
-  sufficient_statistic_nodes = find_sufficient_statistic_nodes(log_joint_node,
-                                                               wrt_argid)
-  natural_parameter_funs = defaultdict(lambda: lambda *args: 0.)
-  for sufficient_statistic_node in sufficient_statistic_nodes:
-    grad_fun = grad_expr(log_joint_node, [sufficient_statistic_node],
-                         stop_nodes=sufficient_statistic_nodes)
-    if sufficient_statistic_node.fun.__name__ == 'einsum':
-      argnums = [i for i, arg in enumerate(sufficient_statistic_node.args[1:])
-                 if is_descendant_of(arg, wrt_node)]
-      _, stat_node, grad_node = (
-          split_einsum_node(sufficient_statistic_node, argnums))
-
-      def make_new_grad_fun(grad_fun, grad_node):
-        def new_grad_fun(*args):
-          env = {key: arg for key, arg in zip(
-              log_joint_node.free_vars.keys(), args)}
-          return [grad_fun(*args)[0] *
-                  eval_node(grad_node, log_joint_node.free_vars, env)]
-        return new_grad_fun
-      grad_fun = make_new_grad_fun(grad_fun, grad_node)
-
-      statistic_str = _summarize_node(stat_node, wrt_node)
-    else:
-      statistic_str = _summarize_node(sufficient_statistic_node, wrt_node)
-
-    def make_new_fun(grad_fun, old_fun):
-      def new_fun(*args):
-        grads = grad_fun(*args)
-        old_params = old_fun(*args)
-        return grads[0] + old_params
-      return new_fun
-    # TODO(mhoffman): This may result in redundant computation. It'd
-    # be better to build one function that returns all of the natural
-    # parameters.
-    natural_parameter_funs[statistic_str] = make_new_fun(
-        grad_fun, natural_parameter_funs[statistic_str])
-
-  return sufficient_statistic_nodes, natural_parameter_funs
-
-
-def split_einsum_node(node, stat_argnums):
+def split_einsum_node(node, stat_argnums, canonicalize=True):
   """Pushes part of an einsum computation up a level in the graph.
 
   Args:
@@ -412,57 +301,6 @@ def split_einsum_node(node, stat_argnums):
   einsum('...ab,,a->', einsum('...ab,...ab->...ab', x, x), -0.5, tau)
   ```
   """
-  assert node.fun is np.einsum
-  formula = node.args[0]
-  assert isinstance(formula, str)
-  in_formulas, out_formula = split_einsum_formula(formula)
-  assert not out_formula
-
-  def shape(arg):
-    if hasattr(arg, 'vs'):
-      return arg.vs.shape
-    elif hasattr(arg, 'shape'):
-      return arg.shape
-    else:
-      return (0,)
-
-  dim_lengths = {}
-  for formula, arg in zip(in_formulas, node.args[1:]):
-    for index, length in zip(formula, shape(arg)):
-      dim_lengths[index] = length
-
-  param_argnums = [i for i in range(len(in_formulas)) if i not in stat_argnums]
-
-  stat_args = [arg_i for i, arg_i in enumerate(node.args[1:])
-               if i in stat_argnums]
-  param_args = [arg_i for i, arg_i in enumerate(node.args[1:])
-                if i in param_argnums]
-
-  stat_inputs = ','.join([input_i for i, input_i in enumerate(in_formulas)
-                          if i in stat_argnums])
-  param_inputs = ','.join([input_i for i, input_i in enumerate(in_formulas)
-                           if i in param_argnums])
-
-  # Using an OrderedDict as an OrderedSet to get the unique output indexes.
-  output_indexes = ''.join(OrderedDict(zip(stat_inputs.replace(',', ''),
-                                           stat_inputs)).keys())
-  ones_indexes = [c for c in output_indexes if c not in param_inputs]
-  ones_args = [np.ones([dim_lengths[index]]) for index in ones_indexes]
-  grad_inputs = ','.join(param_inputs.split(',') + ones_indexes)
-
-  stat_formula = '{}->{}'.format(stat_inputs, output_indexes)
-  potential_formula = '{},{}->'.format(param_inputs, output_indexes)
-  grad_formula = '{}->{}'.format(grad_inputs, output_indexes)
-
-  stat_node = make_node(np.einsum, [stat_formula] + stat_args, node.kwargs)
-  grad_node = make_node(np.einsum, [grad_formula] + param_args + ones_args,
-                        node.kwargs)
-  return make_node(np.einsum, [potential_formula] + param_args + [stat_node],
-                   node.kwargs), stat_node, grad_node
-
-
-def split_einsum_node2(node, stat_argnums, canonicalize=True):
-  """Like split_einsum_node but doesn't produce grad_node."""
   formula = node.args[0]
   assert isinstance(formula, str), "Must use string-formula form of einsum."
   in_formulas, out_formula = split_einsum_formula(formula)
@@ -470,7 +308,8 @@ def split_einsum_node2(node, stat_argnums, canonicalize=True):
   out_formula = out_formula.lstrip('...')
   assert not out_formula, "Must contract to a scalar."
 
-  param_argnums = [i for i, _ in enumerate(in_formulas) if i not in stat_argnums]
+  param_argnums = [i for i, _ in enumerate(in_formulas)
+                     if i not in stat_argnums]
 
   stat_inputs = ','.join(in_formulas[i] for i in stat_argnums)
   param_inputs = ','.join(in_formulas[i] for i in param_argnums)
@@ -494,3 +333,19 @@ def split_einsum_node2(node, stat_argnums, canonicalize=True):
                        + [stat_node],
                        node.kwargs)
   return pot_node, stat_node
+
+
+def grad_namedtuple(fun, argnum=0):
+  assert type(argnum) is int
+  def gradfun(*args):
+    args = list(args)
+    args[argnum], unflatten = _flatten_namedtuple(args[argnum])
+    flat_fun = lambda *args: fun(*subvals(args, [(argnum, unflatten(args[argnum]))]))
+    return unflatten(grad(flat_fun, argnum)(*args))
+  return gradfun
+
+def _flatten_namedtuple(x):
+  try:
+    return tuple(x), lambda tup: type(x)(*tup)
+  except AttributeError:
+    return x, lambda x: x
